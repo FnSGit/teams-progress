@@ -62,6 +62,8 @@ interface TrackedTeammate {
   model?: string;
   /** 展示用思考等级（"off" 不显示） */
   thinking?: string;
+  /** 模型标签已由 config.json 定稿（含判定为直连格式不可信而置空）：锁定后不再重算 */
+  modelLocked?: boolean;
 }
 
 interface TeamMemberInfo {
@@ -146,6 +148,12 @@ function oneLine(text: string, maxChars: number): string {
 function shortModelName(model: string): string {
   const slashIdx = model.lastIndexOf("/");
   return slashIdx !== -1 ? model.substring(slashIdx + 1) : model;
+}
+
+/** 直连格式判定：含 provider 前缀（如 anthropic/claude-x）不在 harness 注册表，
+ * worker 会静默回退会话默认模型，展示层不可信。tier 名（Sonnet/Haiku/Opus/Fable）不含 "/"。 */
+function isDirectFormat(model?: string): boolean {
+  return !!model && model.includes("/");
 }
 
 /** 拆 "model:thinking" 后缀（同 pi-teams applyThinkingSuffix 口径，off 视为无） */
@@ -254,18 +262,30 @@ export default function (pi: ExtensionAPI) {
   let uiTimer: ReturnType<typeof setInterval> | null = null;
   let uiFrame = 0;
 
-  // 优先级：config.json member.model（spawn 实参）> agent 定义 frontmatter
+  // 模型标签只信 config.json 的 member.model（回退 team.defaultModel）——pi-teams 的
+  // effectiveModel（params.model ?? team.defaultModel），决定 worker 实际模型的唯一来源：
+  //   · 空值 → effectiveModel 空 → worker 继承会话默认（省略 model 场景）→ 不可知，置空「?」
+  //   · 直连格式（含 "/"）→ 不在 harness 注册表 → worker 静默回退会话默认 → 不可信，置空
+  //   · tier 名 → 有效，展示
+  // agent 定义的 model 字段不参与 effectiveModel（team-executor 不读），兜底只会给错误值，故不用；
+  // thinking 由 pi-teams applyThinkingSuffix 从 agent 定义取，裸 model（无 :thinking 后缀）时用它兜底。
   const fillModelInfo = (t: TrackedTeammate, diskModel?: string) => {
-    if (t.model) return;
+    // 竞态窗（team:started 早于 registerTeammate 写入）无值：不锁定，等 sweep 补齐
+    if (!diskModel) return;
+    if (t.modelLocked) return;
+    const split = splitModelThinking(diskModel);
+    if (isDirectFormat(split.model)) {
+      t.modelLocked = true; // 直连格式不可信：保持空「?」，不再重算
+      return;
+    }
     const agent = readAgentFrontmatter(
       uiCtx?.cwd ?? process.cwd(),
       t.agentType,
     );
-    const raw = diskModel ?? agent.model;
-    if (!raw) return;
-    const split = splitModelThinking(raw);
-    t.model = split.model ? shortModelName(split.model) : undefined;
+    if (split.model) t.model = shortModelName(split.model);
+    // 裸 model 时思考等级取 agent 定义，同 pi-teams applyThinkingSuffix 口径
     t.thinking = split.thinking ?? agent.thinking;
+    t.modelLocked = true;
   };
 
   const modelLabel = (t: TrackedTeammate): string =>
