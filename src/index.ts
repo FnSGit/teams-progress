@@ -28,6 +28,10 @@
  *   PI_TEAMS_PROGRESS_STALE_MS       无进度事件标记「疑似卡住」的阈值，默认 90000
  *   PI_TEAMS_PROGRESS_UI_MS          footer 状态行动画间隔，默认 900
  *   PI_TEAMS_PROGRESS=0              禁用本扩展
+ *
+ * 诊断：异常路径（ctx 失效 / hasUI=false / setStatus 抛错）追加写入
+ *   ~/.pi/agent/teams-progress-debug.log（低频，常开；PI_TEAMS_PROGRESS_DEBUG=0 关闭）。
+ *   footer 状态行消失而日志无异常记录 ⇒ 问题在 pi 侧渲染链路，不在本扩展。
  */
 
 import * as fs from "node:fs";
@@ -105,6 +109,31 @@ const TEAMS_ROOT =
   process.env.PI_TEAMS_PROGRESS_TEAMS_ROOT ??
   path.join(os.homedir(), ".pi", "teams");
 const SUMMARY_MAX_CHARS = 60;
+
+// ---- 诊断日志：只记异常路径与登记事件，低频常开 ----
+const DEBUG_ENABLED = process.env.PI_TEAMS_PROGRESS_DEBUG !== "0";
+const DEBUG_LOG_PATH =
+  process.env.PI_TEAMS_PROGRESS_DEBUG_LOG ??
+  path.join(os.homedir(), ".pi", "agent", "teams-progress-debug.log");
+const DEBUG_LOG_MAX_BYTES = 256 * 1024;
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function debugLog(event: string, detail: Record<string, unknown> = {}): void {
+  if (!DEBUG_ENABLED) return;
+  try {
+    // 简单尺寸上限：超限直接截断重写（诊断日志允许丢历史）
+    try {
+      if (fs.statSync(DEBUG_LOG_PATH).size > DEBUG_LOG_MAX_BYTES) {
+        fs.writeFileSync(DEBUG_LOG_PATH, "");
+      }
+    } catch {}
+    const entry = { t: new Date().toISOString(), pid: process.pid, event, ...detail };
+    fs.appendFileSync(DEBUG_LOG_PATH, `${JSON.stringify(entry)}\n`);
+  } catch {}
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object"
@@ -298,12 +327,24 @@ export default function (pi: ExtensionAPI) {
   };
 
   const renderUi = () => {
-    if (!uiCtx?.hasUI) return;
-    if (tracked.size === 0) {
+    if (!uiCtx) {
+      // session_start 未到达（加载时序异常）：tracked 非空时 footer 必然缺失，记录之
+      if (tracked.size > 0) debugLog("render_skipped", { reason: "no_ui_ctx", tracked: tracked.size });
+      return;
+    }
+    let hasUI: boolean;
+    try {
+      hasUI = uiCtx.hasUI;
+    } catch (err) {
+      // ctx 失效（session 替换/reload 后旧 ctx getter 抛 assertActive 错误）：
+      // 置空等下一个生命周期事件重新捕获，动画一并停掉
+      debugLog("ctx_stale", { error: errMessage(err), tracked: tracked.size });
+      uiCtx = null;
       stopUiAnimation();
-      try {
-        uiCtx.ui.setStatus(UI_STATUS_KEY, undefined);
-      } catch {}
+      return;
+    }
+    if (!hasUI) {
+      if (tracked.size > 0) debugLog("render_skipped", { reason: "no_ui", tracked: tracked.size });
       return;
     }
     const now = Date.now();
@@ -311,32 +352,30 @@ export default function (pi: ExtensionAPI) {
     const parts: string[] = [];
     for (const t of tracked.values()) {
       const stale = now - t.lastProgressAt > STALE_MS;
-      if (t.activity === "running") {
-        anyRunning = true;
-        const icon = stale
-          ? "⚠"
-          : (UI_SPINNER_FRAMES[uiFrame % UI_SPINNER_FRAMES.length] ?? "⠋");
-        parts.push(
-          uiCtx.ui.theme.fg(
-            stale ? "warning" : "accent",
-            `${icon}${t.name} ${modelLabel(t)} ${fmtDuration(now - t.startedAt)} ${fmtTokens(t.tokens)}`,
-          ),
-        );
-      } else {
-        parts.push(
-          uiCtx.ui.theme.fg(
-            "dim",
-            `·${t.name} ${modelLabel(t)} idle ${fmtDuration(now - t.lastProgressAt)}`,
-          ),
-        );
+      const text =
+        t.activity === "running"
+          ? `${stale ? "⚠" : (UI_SPINNER_FRAMES[uiFrame % UI_SPINNER_FRAMES.length] ?? "⠋")}${t.name} ${modelLabel(t)} ${fmtDuration(now - t.startedAt)} ${fmtTokens(t.tokens)}`
+          : `·${t.name} ${modelLabel(t)} idle ${fmtDuration(now - t.lastProgressAt)}`;
+      anyRunning = anyRunning || t.activity === "running";
+      try {
+        parts.push(uiCtx.ui.theme.fg(stale ? "warning" : t.activity === "running" ? "accent" : "dim", text));
+      } catch (err) {
+        // 主题调用失败不阻断整行：退化为纯文本
+        debugLog("theme_fg_failed", { error: errMessage(err) });
+        parts.push(text);
       }
     }
+    let separator = " │ ";
     try {
-      uiCtx.ui.setStatus(
-        UI_STATUS_KEY,
-        parts.join(uiCtx.ui.theme.fg("dim", " │ ")),
-      );
-    } catch {}
+      separator = uiCtx.ui.theme.fg("dim", " │ ");
+    } catch (err) {
+      debugLog("theme_fg_failed", { error: errMessage(err) });
+    }
+    try {
+      uiCtx.ui.setStatus(UI_STATUS_KEY, parts.join(separator));
+    } catch (err) {
+      debugLog("set_status_failed", { error: errMessage(err), tracked: tracked.size });
+    }
     syncUiAnimation(anyRunning);
   };
 
@@ -383,6 +422,18 @@ export default function (pi: ExtensionAPI) {
       fillModelInfo(t, info?.model); // 心跳补齐（spawn 后 config.json 可能延迟写入）
     }
     if (tracked.size === 0) stopTimer();
+  };
+
+  // git-status 同款防御：每个生命周期事件都重新捕获 ctx。
+  // 一次性捕获的 ctx 在会话替换/reload 后 getter 会抛错（assertActive），而事件订阅
+  // 在共享总线上仍然存活——逐事件刷新是 footer 唯一的自愈途径。
+  const refreshCtx = (ctx: ExtensionContext): void => {
+    try {
+      uiCtx = ctx;
+      renderUi();
+    } catch (err) {
+      debugLog("refresh_ctx_failed", { error: errMessage(err) });
+    }
   };
 
   const buildReport = (now: number): string => {
@@ -503,6 +554,7 @@ export default function (pi: ExtensionAPI) {
     tracked.set(id, t);
     ensureTimer();
     requestReport(FIRST_DELAY_MS);
+    debugLog("team_started", { id, name: t.name, agent: t.agentType });
     renderUi();
   });
 
@@ -545,6 +597,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   const reset = () => {
+    // 隐藏的 session_start/reset 会清空 tracked 并抹掉 footer——team 运行中发生即为异常，记录之
+    if (tracked.size > 0) debugLog("reset_nonempty", { cleared: tracked.size });
     tracked.clear();
     stopTimer();
     renderUi();
@@ -553,6 +607,11 @@ export default function (pi: ExtensionAPI) {
     uiCtx = ctx;
     reset();
   });
+  // 生命周期事件逐个刷新 ctx（同 git-status），保证任何时刻 renderUi 拿到的都是活 ctx
+  pi.on("tool_call", (_event, ctx) => refreshCtx(ctx));
+  pi.on("tool_result", (_event, ctx) => refreshCtx(ctx));
+  pi.on("turn_start", (_event, ctx) => refreshCtx(ctx));
+  pi.on("agent_end", (_event, ctx) => refreshCtx(ctx));
   pi.on("session_shutdown", () => {
     uiCtx = null;
     reset();
