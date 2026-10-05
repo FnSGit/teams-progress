@@ -1,13 +1,32 @@
 {
   "name": "teams-progress",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Teammate progress broadcaster for pi (coordinator mode). Listens to pi-teams lifecycle events, maintains an active-teammate table, and injects progress snapshots into the lead session (status-change report + heartbeat fallback). Renders a one-line footer status (blind-text spinner) alongside git-status.",
   "type": "module",
   "main": "./src/index.ts",
-  "files": ["src", "README.md", "LICENSE"],
-  "keywords": ["pi-package", "pi", "pi-coding-agent", "teams", "teammates", "progress", "coordinator", "agent"],
-  "engines": { "node": ">=20" },
-  "pi": { "extensions": ["./src/index.ts"] },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "teams",
+    "teammates",
+    "progress",
+    "coordinator",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
