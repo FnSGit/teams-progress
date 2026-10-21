@@ -4,13 +4,13 @@
 
 ## 解决什么问题
 
-pi 的协调模式（coordinator mode）派发 teammate 后，运行期间主会话**完全静默**——只有完成/失败（`team:complete` → `triggerTurn`）才唤醒；teammate 静默卡死要等 pi-teams 的 5 分钟超时清扫器兜底。用户感知：状态丢失，不知道在跑还是停了。
+pi 的协调模式（coordinator mode）派发 teammate 后，运行期间主会话**完全静默**——只有完成/失败（`team:complete` → team-notify 唤醒）才介入；teammate 静默卡死要等 pi-teams 的 5 分钟超时清扫器兜底。用户感知：状态丢失，不知道在跑还是停了。
 
 本扩展补上这块缺失的反馈环。
 
 ## 工作机制
 
-监听 pi-teams 发到共享事件总线的生命周期事件，维护活跃 teammate 状态表；「状态变化即报 + 心跳兜底」把进度快照注入主会话（`triggerTurn` 唤醒协调循环，`MIN_GAP` 最小间隔合并突发防刷屏）：
+监听 pi-teams 发到共享事件总线的生命周期事件，维护活跃 teammate 状态表；「状态变化即报 + 心跳兜底」把进度快照注入主会话（`triggerTurn=false`：仅显示不唤醒协调循环——lead 长时间 streaming 期间积压的快照会在 turn 结束时作为 custom message 落盘显示，但不再逐条开 turn 触发模型回复刷屏；真正需要 lead 介入的完成事件由 pi-teams 的 team-notify 负责唤醒，进度快照本身是无状态信息，不该排队等 lead 逐条回应。`MIN_GAP` 最小间隔合并突发）：
 
 | 事件 | 处理 |
 | --- | --- |
